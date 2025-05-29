@@ -1,0 +1,39 @@
+[build-system]
+requires = ["uv_build>=0.7.8,<0.8.0"]
+build-backend = "uv_build"
+
+[project]
+name = "video-watermark-cli"
+version = "0.0.1"
+description = "数字视频水印嵌入/提取工具"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["watermark", "dct", "dwt", "svd","video-processing", "ffmpeg"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = [
+  "click>=8.1.0,<8.2.0",
+  "typer>=0.15.0",
+  "numpy>=1.19.0",
+  "opencv-python>=4.5.0",
+  "qrcode>=7.3.0",
+  "pillow>=8.0.0",
+  "pyzbar>=0.1.6",
+  "pywavelets>=1.7.0",
+  "matplotlib>=3.4.0",
+]
+
+[project.scripts]
+video-watermark-cli = "video_watermark_cli.__main__:app"
+
+
+
