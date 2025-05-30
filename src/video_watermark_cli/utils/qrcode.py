@@ -3,14 +3,13 @@ import numpy as np
 import logging
 import cv2
 from typing import Optional, Union, Tuple
-from PIL import Image as PILImage
-# from qrcode.image.pil import PilImage
+from PIL.Image import Image as PILImage
 import pyzbar.pyzbar as pyzbar
 from video_watermark_cli.config import QR_SIZE
 
 logger = logging.getLogger(__name__)
 
-def generate_qrcode(data, size: int = QR_SIZE)->[PILImage, np.ndarray]:
+def generate_qrcode(data: str, size: int = QR_SIZE) -> np.ndarray:
     """
     生成二维码
     :param data: 要编码的数据
@@ -44,7 +43,7 @@ def generate_qrcode(data, size: int = QR_SIZE)->[PILImage, np.ndarray]:
 
     except Exception as e:
         logger.error(f"生成二维码失败: {e}")
-        raise ValueError("生成二维码失败：{e}")
+        raise ValueError(f"生成二维码失败：{e}")
 
 def decode_qrcode(image: Union[PILImage, np.ndarray]) -> str:
     """
@@ -73,4 +72,4 @@ def decode_qrcode(image: Union[PILImage, np.ndarray]) -> str:
         return decoded_objects[0].data
     except Exception as e:
         logger.error(f"解码二维码失败: {e}")
-        raise ValueError("解码二维码失败：{e}")
+        raise ValueError(f"解码二维码失败：{e}")

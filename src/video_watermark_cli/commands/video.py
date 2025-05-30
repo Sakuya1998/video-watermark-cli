@@ -1,6 +1,7 @@
 import typer
 import cv2
 import time
+import numpy as np
 from video_watermark_cli.core.watermark_core import VideoWatermarker, WaterMarkCore
 from video_watermark_cli.utils.ffmpeg import extract_video_info,transcode_video
 from video_watermark_cli.utils.qrcode import generate_qrcode, decode_qrcode
@@ -146,15 +147,16 @@ def extract(
             start_frame=start_frame,
             end_frame=end_frame
         )
-        if extracted:
+        # 安全地检查extracted是否有效
+        if extracted is not None and isinstance(extracted, np.ndarray) and extracted.size > 0:
             extracted_img = wm_bit_to_image(extracted, wm_shape)
-            cv2.imwrite("output/extracted.png", extracted_img)
+            cv2.imwrite(output_path, extracted_img)
             typer.echo("✅ 水印提取成功")
         else:
             typer.echo("❌ 水印提取失败")
 
         #  解码二维码        
-        qr_img = cv2.imread("output/extracted.png")
+        qr_img = cv2.imread(output_path)
         decoded_text = decode_qrcode(qr_img)
 
         if not decoded_text:

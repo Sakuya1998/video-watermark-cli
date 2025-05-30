@@ -30,6 +30,7 @@ dependencies = [
   "pyzbar>=0.1.6",
   "pywavelets>=1.7.0",
   "matplotlib>=3.4.0",
+  "scipy>=1.7.0",
 ]
 
 [project.scripts]
