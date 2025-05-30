@@ -1,5 +1,6 @@
 import typer
 import cv2
+import time
 from video_watermark_cli.core.watermark_core import VideoWatermarker, WaterMarkCore
 from video_watermark_cli.utils.ffmpeg import extract_video_info,transcode_video
 from video_watermark_cli.utils.qrcode import generate_qrcode, decode_qrcode
@@ -101,10 +102,10 @@ def embed(
         typer.echo("✅ 水印嵌入成功")
         #  转码
         success = transcode_video(temp_path, input_path, output_path)
-        if success and os.path.exists(temp_video_path):
-            os.remove(temp_video_path)
+        if success and os.path.exists(temp_path):
+            os.remove(temp_path)
         else:
-            typer.echo(f"转码失败或临时文件未删除: {temp_video_path}")
+            typer.echo(f"转码失败或临时文件未删除: {temp_path}")
         if not success:
             return False
         typer.echo("✅ 转码成功")

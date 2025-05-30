@@ -14,4 +14,4 @@ FFPROBE_PATH = "ffprobe"
 QR_SIZE = 64  # 二维码图像尺寸（像素
 
 # === Watermark parameters (水印参数) ===
-PASSWORD = "sFlyxXQ3U0HZAV8P"
+PASSWORD = "123456"
