@@ -9,15 +9,23 @@ import logging
 from video_watermark_cli.config import D1, D2
 from video_watermark_cli.core.pool import AutoPool
 from video_watermark_cli.utils.watermark_utils import one_dim_kmeans, random_strategy1, random_strategy2
+try:
+    from reedsolo import RSCodec
+    REEDSOLO_AVAILABLE = True
+except ImportError:
+    REEDSOLO_AVAILABLE = False
+    print("Warning: reedsolo not available. Error correction will be disabled.")
 
 logger = logging.getLogger(__name__)
 
 class WaterMarkCore:
-    def __init__(self, password_img: int = 1, mode: str = 'common', processes: Optional[int] = None) -> None:
+    def __init__(self, password_img: int = 1, mode: str = 'common', processes: Optional[int] = None,
+                 adaptive_quantization: bool = True, error_correction: bool = True,
+                 ecc_redundancy: int = 16) -> None:
         self.block_shape: np.ndarray = np.array([4, 4])
         self.password_img: int = password_img
-        self.d1: int = D1  # 从配置文件读取，避免硬编码高值导致失真
-        self.d2: int = D2  # 从配置文件读取，d1/d2 越大鲁棒性越强,但输出图片的失真越大
+        self.d1: int = int(D1 * 1.5)  # 从配置文件读取，增强水印强度
+        self.d2: int = int(D2 * 1.5)  # 从配置文件读取，d1/d2 越大鲁棒性越强,但输出图片的失真越大
 
         # init data
         self.img: Optional[np.ndarray] = None  # 原图
@@ -31,8 +39,19 @@ class WaterMarkCore:
         self.block_num: int = 0  # 原图片可插入信息的个数
         self.pool = AutoPool(mode=mode, processes=processes)
 
-        self.fast_mode: bool = False
+        self.fast_mode: bool = mode == 'fast'
         self.alpha: Optional[np.ndarray] = None  # 用于处理透明图
+        
+        # 自适应量化和错误纠正参数
+        self.adaptive_quantization = adaptive_quantization
+        self.error_correction = error_correction and REEDSOLO_AVAILABLE
+        self.ecc_redundancy = ecc_redundancy
+        
+        # 初始化Reed-Solomon编码器
+        if self.error_correction:
+            self.rs_codec = RSCodec(self.ecc_redundancy)
+        else:
+            self.rs_codec = None
 
     def init_block_index(self) -> None:
         self.block_num = self.ca_block_shape[0] * self.ca_block_shape[1]
@@ -73,8 +92,63 @@ class WaterMarkCore:
                                                                      self.ca_block_shape, strides)
 
     def read_wm(self, wm_bit: np.ndarray) -> None:
-        self.wm_bit = wm_bit
-        self.wm_size = wm_bit.size
+        # 保存原始水印大小
+        self.original_wm_size = wm_bit.size
+        
+        # 应用错误纠正编码
+        if self.error_correction and REEDSOLO_AVAILABLE:
+            # 将二进制水印转换为字节
+            wm_bytes = np.packbits(wm_bit)
+            # 应用Reed-Solomon编码
+            encoded_bytes = self.rs_codec.encode(wm_bytes)
+            # 转回二进制比特
+            encoded_bits = np.unpackbits(np.frombuffer(encoded_bytes, dtype=np.uint8))
+            self.wm_bit = encoded_bits
+        else:
+            self.wm_bit = wm_bit
+            
+        self.wm_size = self.wm_bit.size
+        
+    def analyze_image_features(self, block):
+        """分析图像块特征，用于自适应量化"""
+        # 计算块的纹理复杂度 (使用方差作为简单度量)
+        texture_complexity = np.var(block)
+        
+        # 计算块的亮度
+        brightness = np.mean(block)
+        
+        # 计算块的对比度
+        contrast = np.max(block) - np.min(block) if np.max(block) != np.min(block) else 1.0
+        
+        # 计算块的频率特性 (使用DCT系数的能量)
+        dct_block = dct(block)
+        energy = np.sum(np.abs(dct_block)) / (self.block_shape[0] * self.block_shape[1])
+        
+        # 计算局部熵（信息量）
+        hist, _ = np.histogram(block, bins=8, range=(0, 255))
+        hist = hist / hist.sum() if hist.sum() > 0 else hist
+        entropy = -np.sum(hist * np.log2(hist + 1e-10))
+        
+        # 计算边缘强度
+        if block.shape[0] > 1 and block.shape[1] > 1:
+            dx = np.diff(block, axis=0)
+            dy = np.diff(block, axis=1)
+            edge_strength = np.mean(np.abs(dx)) + np.mean(np.abs(dy))
+        else:
+            edge_strength = 0
+        
+        # 计算频域特征（DCT系数方差）
+        dct_var = np.var(dct_block)
+        
+        return {
+            'texture': texture_complexity,
+            'brightness': brightness,
+            'contrast': contrast,
+            'energy': energy,
+            'entropy': entropy,
+            'edge_strength': edge_strength,
+            'dct_var': dct_var
+        }
 
     def block_add_wm(self, arg):
         if self.fast_mode:
@@ -85,15 +159,65 @@ class WaterMarkCore:
     def block_add_wm_slow(self, arg):
         block, shuffler, i = arg
         # dct->(flatten->加密->逆flatten)->svd->打水印->逆svd->(flatten->解密->逆flatten)->逆dct
-        wm_1 = self.wm_bit[i % self.wm_size]
+        wm_bit = self.wm_bit[i % self.wm_size]
         block_dct = dct(block)
 
         # 加密（打乱顺序）
         block_dct_shuffled = block_dct.flatten()[shuffler].reshape(self.block_shape)
         u, s, v = svd(block_dct_shuffled)
-        s[0] = (s[0] // self.d1 + 1 / 4 + 1 / 2 * wm_1) * self.d1
-        if self.d2:
-            s[1] = (s[1] // self.d2 + 1 / 4 + 1 / 2 * wm_1) * self.d2
+        
+        # 自适应量化策略
+        if self.adaptive_quantization:
+            # 分析图像特征
+            features = self.analyze_image_features(block)
+            
+            # 根据图像特征调整量化参数
+            # 纹理复杂度高的区域需要更强的嵌入强度
+            texture_factor = min(2.0, max(0.5, 1.0 + features['texture'] / 1000))
+            # 能量高的区域可以承载更多信息
+            energy_factor = min(2.0, max(0.5, 1.0 + features['energy'] / 100))
+            # 对比度低的区域需要更强的嵌入
+            contrast_factor = min(2.0, max(0.5, 1.0 + 1.0 / (features['contrast'] + 0.1)))
+            # 熵高的区域可以承载更强的水印
+            entropy_factor = min(2.0, max(0.5, 1.0 + features.get('entropy', 0) / 3))
+            # 边缘强度高的区域可以承载更强的水印
+            edge_factor = min(2.0, max(0.5, 1.0 + features.get('edge_strength', 0) / 50))
+            # DCT变异高的区域可以承载更强的水印
+            dct_factor = min(2.0, max(0.5, 1.0 + features.get('dct_var', 0) / 1000))
+            
+            # 综合因子，决定嵌入强度 - 使用加权平均
+            weights = [0.3, 0.2, 0.15, 0.15, 0.1, 0.1]  # 权重总和为1
+            factors = [texture_factor, energy_factor, contrast_factor, 
+                      entropy_factor, edge_factor, dct_factor]
+            strength_factor = sum(w * f for w, f in zip(weights, factors))
+            
+            # 调整量化点 - 使用更极端的值以增强鲁棒性
+            if wm_bit == 1:
+                q_high = min(0.98, max(0.85, 0.95 - (1 - strength_factor) * 0.1))
+            else:
+                q_low = max(0.02, min(0.15, 0.05 + (1 - strength_factor) * 0.1))
+        else:
+            # 使用固定量化点
+            q_high = 0.95  # 嵌入1的量化点 - 更极端的值
+            q_low = 0.05   # 嵌入0的量化点 - 更极端的值
+        
+        # 量化嵌入
+        quotient = s[0] // self.d1
+        
+        if wm_bit == 1:
+            # 嵌入1：设置为区间的高位置
+            s[0] = (quotient + q_high) * self.d1
+        else:
+            # 嵌入0：设置为区间的低位置
+            s[0] = (quotient + q_low) * self.d1
+            
+        # 如果使用D2参数，对第二个奇异值也进行嵌入
+        if self.d2 and len(s) > 1:
+            quotient2 = s[1] // self.d2
+            if wm_bit == 1:
+                s[1] = (quotient2 + q_high) * self.d2
+            else:
+                s[1] = (quotient2 + q_low) * self.d2
 
         block_dct_flatten = np.dot(u, np.dot(np.diag(s), v)).flatten()
         block_dct_flatten[shuffler] = block_dct_flatten.copy()
@@ -102,10 +226,53 @@ class WaterMarkCore:
     def block_add_wm_fast(self, arg):
         # dct->svd->打水印->逆svd->逆dct
         block, shuffler, i = arg
-        wm_1 = self.wm_bit[i % self.wm_size]
+        wm_bit = self.wm_bit[i % self.wm_size]
 
         u, s, v = svd(dct(block))
-        s[0] = (s[0] // self.d1 + 1 / 4 + 1 / 2 * wm_1) * self.d1
+        
+        # 自适应量化策略
+        if self.adaptive_quantization:
+            # 分析图像特征
+            features = self.analyze_image_features(block)
+            
+            # 根据图像特征调整量化参数
+            # 纹理复杂度高的区域需要更强的嵌入强度
+            texture_factor = min(2.0, max(0.5, 1.0 + features['texture'] / 1000))
+            # 能量高的区域可以承载更多信息
+            energy_factor = min(2.0, max(0.5, 1.0 + features['energy'] / 100))
+            # 对比度低的区域需要更强的嵌入
+            contrast_factor = min(2.0, max(0.5, 1.0 + 1.0 / (features['contrast'] + 0.1)))
+            # 熵高的区域可以承载更强的水印
+            entropy_factor = min(2.0, max(0.5, 1.0 + features.get('entropy', 0) / 3))
+            # 边缘强度高的区域可以承载更强的水印
+            edge_factor = min(2.0, max(0.5, 1.0 + features.get('edge_strength', 0) / 50))
+            # DCT变异高的区域可以承载更强的水印
+            dct_factor = min(2.0, max(0.5, 1.0 + features.get('dct_var', 0) / 1000))
+            
+            # 综合因子，决定嵌入强度 - 使用加权平均
+            weights = [0.3, 0.2, 0.15, 0.15, 0.1, 0.1]  # 权重总和为1
+            factors = [texture_factor, energy_factor, contrast_factor, 
+                      entropy_factor, edge_factor, dct_factor]
+            strength_factor = sum(w * f for w, f in zip(weights, factors))
+            
+            # 调整量化点 - 使用更极端的值以增强鲁棒性
+            if wm_bit == 1:
+                q_high = min(0.98, max(0.85, 0.95 - (1 - strength_factor) * 0.1))
+            else:
+                q_low = max(0.02, min(0.15, 0.05 + (1 - strength_factor) * 0.1))
+        else:
+            # 使用固定量化点 - 使用更极端的值
+            q_high = 0.95  # 嵌入1的量化点 - 更极端的值
+            q_low = 0.05   # 嵌入0的量化点 - 更极端的值
+        
+        # 量化嵌入
+        quotient = s[0] // self.d1
+        if wm_bit == 1:
+            # 嵌入1：设置为区间的高位置
+            s[0] = (quotient + q_high) * self.d1
+        else:
+            # 嵌入0：设置为区间的低位置
+            s[0] = (quotient + q_low) * self.d1
 
         return idct(np.dot(u, np.dot(np.diag(s), v)))
 
@@ -158,22 +325,119 @@ class WaterMarkCore:
         block_dct_shuffled = dct(block).flatten()[shuffler].reshape(self.block_shape)
 
         u, s, v = svd(block_dct_shuffled)
-        # SVD返回的s是一维数组，取第一个元素作为标量
+        
+        # 自适应阈值判断
+        if self.adaptive_quantization:
+            # 分析图像特征以确定阈值
+            features = self.analyze_image_features(block)
+            
+            # 根据图像特征调整阈值
+            texture_factor = min(1.0, max(0.5, features['texture'] / 1000))
+            energy_factor = min(1.0, max(0.5, features['energy'] / 100))
+            contrast_factor = min(1.0, max(0.5, 1.0 / (features['contrast'] + 0.1)))
+            
+            strength_factor = (texture_factor + energy_factor + contrast_factor) / 3.0
+            
+            # 调整量化点（与嵌入时保持一致）
+            q_high = min(0.95, max(0.8, 0.9 * strength_factor))
+            q_low = max(0.05, min(0.2, 0.1 / strength_factor))
+            
+            # 动态阈值
+            threshold = (q_high + q_low) / 2.0
+        else:
+            # 使用固定阈值
+            q_high = 0.9
+            q_low = 0.1
+            threshold = 0.5
+        
+        # 水印提取
         s0_val = s[0]
-        wm = int(s0_val % self.d1 > self.d1 / 2)
-        if self.d2:
+        remainder = s0_val % self.d1
+        
+        # 使用动态阈值进行判决
+        if remainder < threshold * self.d1:
+            wm1 = 0  # 更接近低量化点
+        else:
+            wm1 = 1  # 更接近高量化点
+            
+        # 如果使用D2参数，对第二个奇异值也进行提取
+        if self.d2 and len(s) > 1:
             s1_val = s[1]
-            tmp = int(s1_val % self.d2 > self.d2 / 2)
-            wm = (wm * 3 + tmp * 1) / 4
+            remainder2 = s1_val % self.d2
+            
+            if remainder2 < threshold * self.d2:
+                wm2 = 0
+            else:
+                wm2 = 1
+                
+            # 改进的双参数融合策略：使用更精确的置信度计算
+            # 计算到各自目标点的距离
+            dist1_to_0 = abs(remainder - q_low * self.d1)
+            dist1_to_1 = abs(remainder - q_high * self.d1)
+            confidence1 = abs(dist1_to_0 - dist1_to_1) / ((q_high - q_low) * self.d1)
+            
+            dist2_to_0 = abs(remainder2 - q_low * self.d2)
+            dist2_to_1 = abs(remainder2 - q_high * self.d2)
+            confidence2 = abs(dist2_to_0 - dist2_to_1) / ((q_high - q_low) * self.d2)
+            
+            # 选择置信度更高的结果
+            if confidence1 > confidence2:
+                wm = wm1
+            elif confidence2 > confidence1:
+                wm = wm2
+            else:
+                # 置信度相等时，使用简单投票
+                wm = int((wm1 + wm2) >= 1)
+        else:
+            wm = wm1
+            
         return wm
 
     def block_get_wm_fast(self, args):
         block, shuffler = args
         # dct->svd->解水印
         u, s, v = svd(dct(block))
-        # SVD返回的s是一维数组，取第一个元素作为标量
+        
+        # 自适应阈值判断
+        if self.adaptive_quantization:
+            # 分析图像特征以确定阈值
+            features = self.analyze_image_features(block)
+            
+            # 根据图像特征调整阈值
+            texture_factor = min(2.0, max(0.5, 1.0 + features['texture'] / 1000))
+            energy_factor = min(2.0, max(0.5, 1.0 + features['energy'] / 100))
+            contrast_factor = min(2.0, max(0.5, 1.0 + 1.0 / (features['contrast'] + 0.1)))
+            entropy_factor = min(2.0, max(0.5, 1.0 + features.get('entropy', 0) / 3))
+            edge_factor = min(2.0, max(0.5, 1.0 + features.get('edge_strength', 0) / 50))
+            dct_factor = min(2.0, max(0.5, 1.0 + features.get('dct_var', 0) / 1000))
+            
+            # 综合因子，决定嵌入强度 - 使用加权平均
+            weights = [0.3, 0.2, 0.15, 0.15, 0.1, 0.1]  # 权重总和为1
+            factors = [texture_factor, energy_factor, contrast_factor, 
+                      entropy_factor, edge_factor, dct_factor]
+            strength_factor = sum(w * f for w, f in zip(weights, factors))
+            
+            # 调整量化点（与嵌入时保持一致）
+            q_high = min(0.98, max(0.85, 0.95 - (1 - strength_factor) * 0.1))
+            q_low = max(0.02, min(0.15, 0.05 + (1 - strength_factor) * 0.1))
+            
+            # 动态阈值
+            threshold = (q_high + q_low) / 2.0
+        else:
+            # 使用固定阈值 - 与更新的量化点保持一致
+            q_high = 0.95
+            q_low = 0.05
+            threshold = (q_high + q_low) / 2.0
+        
+        # 水印提取
         s0_val = s[0]
-        wm = int(s0_val % self.d1 > self.d1 / 2)
+        remainder = s0_val % self.d1
+        
+        # 使用动态阈值进行判决
+        if remainder < threshold * self.d1:
+            wm = 0  # 更接近低量化点
+        else:
+            wm = 1  # 更接近高量化点
 
         return wm
 
@@ -202,18 +466,81 @@ class WaterMarkCore:
         return wm_avg
 
     def extract(self, img: np.ndarray, wm_shape: Tuple[int, ...]) -> np.ndarray:
-        self.wm_size = np.array(wm_shape).prod()
+        # 计算原始水印大小（不包含错误纠正码）
+        original_wm_size = np.array(wm_shape).prod()
+        self.original_wm_size = original_wm_size  # 保存原始水印大小
+        
+        # 如果使用了错误纠正编码，需要提取更多比特
+        if self.error_correction and REEDSOLO_AVAILABLE:
+            # 计算编码后的大小（字节数）
+            original_bytes_count = (original_wm_size + 7) // 8  # 向上取整到字节
+            encoded_bytes_count = original_bytes_count + self.ecc_redundancy
+            # 编码后的比特数
+            self.wm_size = encoded_bytes_count * 8
+        else:
+            self.wm_size = original_wm_size
 
         # 提取每个分块埋入的 bit：
         wm_block_bit = self.extract_raw(img=img)
         # 做平均：
         wm_avg = self.extract_avg(wm_block_bit)
-        return wm_avg
+        
+        # 应用错误纠正解码
+        if self.error_correction and REEDSOLO_AVAILABLE:
+            try:
+                # 二值化
+                wm_bin = np.round(wm_avg).astype(np.uint8)
+                # 转换为字节
+                wm_bytes = np.packbits(wm_bin)
+                # 应用Reed-Solomon解码
+                decoded_bytes = self.rs_codec.decode(wm_bytes)[0]  # [0]是解码后的数据，[1]是纠正的位置
+                # 转回二进制比特
+                decoded_bits = np.unpackbits(np.frombuffer(decoded_bytes, dtype=np.uint8))
+                # 截取到原始水印大小
+                return decoded_bits[:original_wm_size]
+            except Exception as e:
+                logger.warning(f"错误纠正解码失败: {e}，使用原始提取结果")
+                # 确保返回的水印大小与原始水印一致
+                return wm_avg[:original_wm_size]
+        else:
+            # 确保返回的水印大小与原始水印一致
+            return wm_avg[:original_wm_size]
 
     def extract_with_kmeans(self, img: np.ndarray, wm_shape: Tuple[int, ...]) -> np.ndarray:
+        # 提取水印
         wm_avg = self.extract(img=img, wm_shape=wm_shape)
-
-        return one_dim_kmeans(wm_avg)
+        
+        # 如果已经应用了错误纠正解码，结果应该已经是二值化的
+        if self.error_correction and REEDSOLO_AVAILABLE and wm_avg.dtype == np.uint8:
+            return wm_avg
+        
+        # 预处理：平滑水印值，减少噪声影响
+        # 使用中值滤波平滑水印值
+        wm_avg_reshaped = wm_avg.reshape(wm_shape) if len(wm_shape) > 1 else wm_avg
+        
+        # 应用K-means聚类进行二值化
+        binary_wm = one_dim_kmeans(wm_avg)
+        
+        # 后处理：使用多数投票法处理可能的错误
+        # 如果水印是二维的，可以考虑局部区域的一致性
+        if len(wm_shape) > 1 and min(wm_shape) > 2:
+            binary_wm_reshaped = binary_wm.reshape(wm_shape)
+            # 使用3x3的局部窗口进行多数投票
+            for i in range(1, wm_shape[0]-1):
+                for j in range(1, wm_shape[1]-1):
+                    # 获取3x3窗口
+                    window = binary_wm_reshaped[i-1:i+2, j-1:j+2]
+                    # 计算0和1的数量
+                    zeros = np.sum(window == 0)
+                    ones = np.sum(window == 1)
+                    # 如果周围大多数是0或1，则将当前位置设为多数值
+                    if zeros > ones + 2:  # 需要明显的多数
+                        binary_wm_reshaped[i, j] = 0
+                    elif ones > zeros + 2:
+                        binary_wm_reshaped[i, j] = 1
+            binary_wm = binary_wm_reshaped.flatten()
+        
+        return binary_wm
 
 class VideoWatermarker:
     def __init__(self, password_img: int = 1, mode: str = 'common', processes: Optional[int] = None) -> None:

@@ -4,47 +4,75 @@ from typing import Union
 
 def one_dim_kmeans(inputs):
     """
-    一维K-means聚类算法，用于二值化提取的水印
+    改进的一维K-means聚类算法，用于二值化提取的水印
     :param inputs: 输入数据
-    :return: 二值化结果
+    :return: 二值化结果（uint8类型，值为0或1）
     """
     # 检查输入数组是否为空或只有一个元素
     if inputs.size == 0:
-        return np.array([], dtype=bool)
+        return np.array([], dtype=np.uint8)
     if inputs.size == 1:
-        return np.array([inputs[0] > 0], dtype=bool)
+        return np.array([1 if inputs[0] > 0 else 0], dtype=np.uint8)
     
     # 检查所有元素是否相同
     if np.all(inputs == inputs[0]):
         # 如果所有元素都相同，根据值返回全0或全1
-        return np.ones_like(inputs, dtype=bool) if inputs[0] > 0 else np.zeros_like(inputs, dtype=bool)
+        return np.ones_like(inputs, dtype=np.uint8) if inputs[0] > 0 else np.zeros_like(inputs, dtype=np.uint8)
     
-    threshold = 0
-    e_tol = 10 ** (-6)
-    center = [inputs.min(), inputs.max()]  # 1. 初始化中心点
-    for i in range(300):
-        threshold = (center[0] + center[1]) / 2
-        is_class01 = inputs > threshold  # 2. 检查所有点与这k个点之间的距离，每个点归类到最近的中心
-        
-        # 安全地计算均值，避免空数组
-        if np.any(~is_class01):
-            center_0 = inputs[~is_class01].mean()
+    # 预处理：去除极端值，减少噪声影响
+    sorted_inputs = np.sort(inputs)
+    q1_idx = int(inputs.size * 0.05)  # 5%分位数
+    q3_idx = int(inputs.size * 0.95)  # 95%分位数
+    filtered_inputs = inputs[(inputs >= sorted_inputs[q1_idx]) & (inputs <= sorted_inputs[q3_idx])]
+    
+    # 如果过滤后数组为空，使用原始数组
+    if filtered_inputs.size == 0:
+        filtered_inputs = inputs
+    
+    # 使用OTSU方法找到最佳阈值
+    try:
+        # 将数据归一化到0-255范围，以便使用OTSU
+        min_val = filtered_inputs.min()
+        max_val = filtered_inputs.max()
+        if max_val > min_val:  # 避免除以零
+            normalized = ((filtered_inputs - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+            # 使用OTSU方法找到最佳阈值
+            _, binary = cv2.threshold(normalized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # 将阈值映射回原始范围
+            otsu_threshold = (binary[0, 0] / 255.0) * (max_val - min_val) + min_val
+            threshold = otsu_threshold
         else:
-            center_0 = inputs.min()
-            
-        if np.any(is_class01):
-            center_1 = inputs[is_class01].mean()
-        else:
-            center_1 = inputs.max()
-            
-        center = [center_0, center_1]  # 3. 重新找中心点
-        
-        if np.abs((center[0] + center[1]) / 2 - threshold) < e_tol:  # 4. 停止条件
+            # 如果所有值相同，使用该值作为阈值
+            threshold = min_val
+    except Exception:
+        # 如果OTSU方法失败，回退到传统K-means
+        threshold = 0
+        e_tol = 10 ** (-6)
+        center = [inputs.min(), inputs.max()]  # 1. 初始化中心点
+        for i in range(300):
             threshold = (center[0] + center[1]) / 2
-            break
+            is_class01 = inputs > threshold  # 2. 检查所有点与这k个点之间的距离，每个点归类到最近的中心
+            
+            # 安全地计算均值，避免空数组
+            if np.any(~is_class01):
+                center_0 = inputs[~is_class01].mean()
+            else:
+                center_0 = inputs.min()
+                
+            if np.any(is_class01):
+                center_1 = inputs[is_class01].mean()
+            else:
+                center_1 = inputs.max()
+                
+            center = [center_0, center_1]  # 3. 重新找中心点
+            
+            if np.abs((center[0] + center[1]) / 2 - threshold) < e_tol:  # 4. 停止条件
+                threshold = (center[0] + center[1]) / 2
+                break
 
     is_class01 = inputs > threshold
-    return is_class01
+    # 将bool类型转换为uint8类型（0或1）
+    return is_class01.astype(np.uint8)
 
 def random_strategy1(seed, size, block_shape):
     """
